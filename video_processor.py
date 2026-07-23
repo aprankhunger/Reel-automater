@@ -273,20 +273,25 @@ def _create_text_overlay(quote, width, height, font_path, emoji_font_path):
     return img
 
 
+# Fixed reel canvas: guarantees the overlay and video always line up,
+# regardless of source resolution or rotation metadata from phone videos.
+REEL_WIDTH = 1080
+REEL_HEIGHT = 1920
+
+
 def process_video(input_path, output_path, quote):
     """
-    Takes a raw video, extracts a random 15-second clip,
-    applies a subtle dark blur, and overlays styled text.
+    Takes a raw video, extracts a random 15-second clip, normalizes it to a
+    1080x1920 reel canvas (scale-to-cover + center crop), applies a subtle
+    dark blur, and overlays styled text perfectly centered.
     Output is muted (no audio) for faster processing.
     """
     overlay_path = None
     try:
-        # Get video duration and dimensions
+        # Get video duration
         probe = ffmpeg.probe(input_path)
         video_info = next(s for s in probe['streams'] if s['codec_type'] == 'video')
         duration = float(video_info.get('duration', probe['format'].get('duration', 0)))
-        vid_width = int(video_info['width'])
-        vid_height = int(video_info['height'])
 
         # 15 seconds clip
         clip_duration = min(15, duration)
@@ -303,11 +308,11 @@ def process_video(input_path, output_path, quote):
         emoji_font_path = _find_font("NotoColorEmoji.ttf")
         logger.info(f"Text font: {font_path} | Emoji font: {emoji_font_path}")
 
-        # --- Create text overlay image with Pillow ---
-        overlay_img = _create_text_overlay(quote, vid_width, vid_height, font_path, emoji_font_path)
+        # --- Create text overlay image with Pillow (always at reel size) ---
+        overlay_img = _create_text_overlay(quote, REEL_WIDTH, REEL_HEIGHT, font_path, emoji_font_path)
         overlay_path = output_path.replace(".mp4", "_overlay.png")
         overlay_img.save(overlay_path)
-        logger.info(f"Created text overlay: {overlay_path} ({vid_width}x{vid_height})")
+        logger.info(f"Created text overlay: {overlay_path} ({REEL_WIDTH}x{REEL_HEIGHT})")
 
         # --- Build FFmpeg pipeline (video only, audio stripped) ---
         stream = ffmpeg.input(input_path, ss=start_time, t=clip_duration)
@@ -315,12 +320,21 @@ def process_video(input_path, output_path, quote):
 
         v = stream.video
 
+        # Normalize to the reel canvas: scale to cover, then center-crop.
+        # FFmpeg applies rotation metadata before filters, so this is
+        # correct even for rotated phone videos.
+        v = v.filter('scale', w=REEL_WIDTH, h=REEL_HEIGHT,
+                     force_original_aspect_ratio='increase')
+        v = v.filter('crop', REEL_WIDTH, REEL_HEIGHT,
+                     f'(iw-{REEL_WIDTH})/2', f'(ih-{REEL_HEIGHT})/2')
+        v = v.filter('setsar', 1)
+
         # Subtle darken and gentle blur
         v = v.filter('eq', brightness=-0.15)
         v = v.filter('gblur', sigma=4)
 
-        # Overlay the text PNG on top of the blurred video
-        v = ffmpeg.overlay(v, overlay_input, x=0, y=0)
+        # Overlay the text PNG, centered on the canvas (exact match in size)
+        v = ffmpeg.overlay(v, overlay_input, x='(W-w)/2', y='(H-h)/2')
 
         # No audio: faster encode, smaller file
         out = ffmpeg.output(
