@@ -1,11 +1,14 @@
 import ffmpeg
 import random
-import textwrap
 import os
-import re
 import glob
 from PIL import Image, ImageDraw, ImageFont
 from config import logger
+
+try:
+    import emoji as emoji_lib
+except ImportError:
+    emoji_lib = None
 
 
 def _find_font(name):
@@ -32,7 +35,6 @@ def _find_font(name):
     for c in candidates:
         if os.path.exists(c):
             logger.info(f"Found font at: {c}")
-            # Cache it
             os.makedirs(cache_dir, exist_ok=True)
             shutil.copy2(c, cached)
             return cached
@@ -64,85 +66,209 @@ def _find_font(name):
     return None
 
 
-def _create_text_overlay(quote, width, height, font_path):
+# ---------------------------------------------------------------------------
+# Emoji rendering (Noto Color Emoji is a bitmap font: it only rasterizes at
+# specific strike sizes, so we render big once, cache, and resize down).
+# ---------------------------------------------------------------------------
+
+_EMOJI_BITMAP_CACHE = {}
+
+
+def _render_emoji_image(char, target_size, emoji_font_path):
+    """Render a single emoji as an RGBA image of target_size height. Returns None on failure."""
+    if not emoji_font_path:
+        return None
+
+    key = (char, target_size)
+    if key in _EMOJI_BITMAP_CACHE:
+        return _EMOJI_BITMAP_CACHE[key]
+
+    rendered = None
+    # Noto Color Emoji strikes: 109 is the classic CBDT size; try alternates too.
+    for strike in (109, 128, 136, 160, 96, 64, 32):
+        try:
+            f = ImageFont.truetype(emoji_font_path, strike)
+            canvas_size = strike * 2
+            tmp = Image.new("RGBA", (canvas_size, canvas_size), (0, 0, 0, 0))
+            d = ImageDraw.Draw(tmp)
+            d.text((strike // 2, strike // 2), char, font=f, embedded_color=True)
+            bbox = tmp.getbbox()
+            if bbox and (bbox[2] - bbox[0]) > 2 and (bbox[3] - bbox[1]) > 2:
+                cropped = tmp.crop(bbox)
+                # Scale to target height, preserve aspect ratio
+                w, h = cropped.size
+                new_h = target_size
+                new_w = max(1, int(w * (new_h / h)))
+                rendered = cropped.resize((new_w, new_h), Image.LANCZOS)
+                break
+        except Exception:
+            continue
+
+    _EMOJI_BITMAP_CACHE[key] = rendered
+    if rendered is None:
+        logger.warning(f"Could not render emoji: {char!r}")
+    return rendered
+
+
+def _split_segments(text):
+    """Split a string into [('text', str) | ('emoji', str)] segments."""
+    if not emoji_lib:
+        return [("text", text)] if text else []
+    segments = []
+    last = 0
+    for match in emoji_lib.emoji_list(text):
+        start, end = match["match_start"], match["match_end"]
+        if start > last:
+            segments.append(("text", text[last:start]))
+        segments.append(("emoji", match["emoji"]))
+        last = end
+    if last < len(text):
+        segments.append(("text", text[last:]))
+    return segments
+
+
+def _segments_width(draw, font, segments, emoji_size, emoji_pad):
+    """Measure the pixel width of a list of segments."""
+    total = 0
+    for kind, content in segments:
+        if kind == "text":
+            total += draw.textlength(content, font=font)
+        else:
+            total += emoji_size + emoji_pad * 2
+    return total
+
+
+def _wrap_words(draw, font, words, max_width, emoji_size, emoji_pad):
+    """Greedy word wrap. Each word is a list of segments. Returns list of lines (list of segments)."""
+    space_w = draw.textlength(" ", font=font)
+    lines = []
+    current = []
+    current_w = 0
+
+    for word_segs in words:
+        word_w = _segments_width(draw, font, word_segs, emoji_size, emoji_pad)
+        add_w = word_w + (space_w if current else 0)
+        if current and current_w + add_w > max_width:
+            lines.append(current)
+            current = list(word_segs)
+            current_w = word_w
+        else:
+            if current:
+                current = current + [("text", " ")] + list(word_segs)
+                current_w += add_w
+            else:
+                current = list(word_segs)
+                current_w = word_w
+    if current:
+        lines.append(current)
+    return lines
+
+
+def _layout_text(draw, quote, width, height, font_path):
     """
-    Create a transparent PNG with the quote text centered.
-    Uses Bebas Neue for a classy, modern look.
+    Smart layout: auto-shrinks the font until the whole quote fits nicely
+    inside a safe zone (centered, away from edges).
+    Returns (font, font_size, lines, line_height, emoji_size, emoji_pad).
+    """
+    max_text_width = int(width * 0.80)   # safe horizontal zone
+    max_text_height = int(height * 0.55)  # safe vertical zone
+
+    # Words as segment lists (preserving user line breaks)
+    paragraphs = []
+    for para in quote.split("\n"):
+        words = [w for w in para.split(" ") if w]
+        paragraphs.append([_split_segments(w) for w in words])
+
+    font_size = max(30, int(height / 15))
+    min_font_size = 26
+
+    while True:
+        try:
+            font = ImageFont.truetype(font_path, font_size)
+        except Exception:
+            font = ImageFont.load_default()
+        emoji_size = int(font_size * 1.0)
+        emoji_pad = max(2, int(font_size * 0.06))
+
+        lines = []
+        for words in paragraphs:
+            if not words:
+                continue
+            lines.extend(_wrap_words(draw, font, words, max_text_width, emoji_size, emoji_pad))
+
+        line_height = int(font_size * 1.35)
+        block_height = len(lines) * line_height
+        widest = max(
+            (_segments_width(draw, font, ln, emoji_size, emoji_pad) for ln in lines),
+            default=0,
+        )
+
+        if (block_height <= max_text_height and widest <= max_text_width) or font_size <= min_font_size:
+            return font, font_size, lines, line_height, emoji_size, emoji_pad
+
+        font_size = max(min_font_size, int(font_size * 0.9))
+
+
+def _create_text_overlay(quote, width, height, font_path, emoji_font_path):
+    """
+    Create a transparent PNG with the quote perfectly centered.
+    - Each line is measured (text + emoji) and centered individually.
+    - Emojis are rendered in full color from Noto Color Emoji.
+    - Font auto-shrinks so long quotes never spill to the edges.
     """
     img = Image.new("RGBA", (width, height), (0, 0, 0, 0))
     draw = ImageDraw.Draw(img)
 
-    # Scale font size relative to video height — Bebas Neue looks great large
-    font_size = max(32, int(height / 14))
-    try:
-        font = ImageFont.truetype(font_path, font_size)
-        logger.info(f"Loaded font '{font_path}' at size {font_size}")
-    except Exception as e:
-        logger.warning(f"Failed to load font '{font_path}': {e}, using default")
-        font = ImageFont.load_default()
+    quote = quote.strip()
+    if not quote:
+        return img
 
-    # Wrap text to fit within ~75% of video width
-    max_text_width = int(width * 0.75)
-    words = quote.split()
-    lines = []
-    current_line = ""
-
-    for word in words:
-        test_line = f"{current_line} {word}".strip()
-        bbox = draw.textbbox((0, 0), test_line, font=font)
-        test_width = bbox[2] - bbox[0]
-        if test_width <= max_text_width:
-            current_line = test_line
-        else:
-            if current_line:
-                lines.append(current_line)
-            current_line = word
-    if current_line:
-        lines.append(current_line)
-
-    wrapped_text = "\n".join(lines)
-    line_spacing = int(font_size * 0.35)
-
-    # Calculate text bounding box for centering
-    bbox = draw.multiline_textbbox((0, 0), wrapped_text, font=font, spacing=line_spacing)
-    text_w = bbox[2] - bbox[0]
-    text_h = bbox[3] - bbox[1]
-
-    x = (width - text_w) // 2
-    y = (height - text_h) // 2
-
-    # Draw soft shadow for depth
-    shadow_offset = max(3, int(font_size * 0.05))
-    draw.multiline_text(
-        (x + shadow_offset, y + shadow_offset),
-        wrapped_text, font=font,
-        fill=(0, 0, 0, 160),
-        align="center",
-        spacing=line_spacing
+    font, font_size, lines, line_height, emoji_size, emoji_pad = _layout_text(
+        draw, quote, width, height, font_path
     )
+    logger.info(f"Text layout: font_size={font_size}, lines={len(lines)}")
 
-    # Thin outline for crispness
-    outline_width = 2
-    for dx in range(-outline_width, outline_width + 1):
-        for dy in range(-outline_width, outline_width + 1):
-            if dx == 0 and dy == 0:
-                continue
-            draw.multiline_text(
-                (x + dx, y + dy),
-                wrapped_text, font=font,
-                fill=(0, 0, 0, 100),
-                align="center",
-                spacing=line_spacing
-            )
+    block_height = len(lines) * line_height
+    y = (height - block_height) // 2
 
-    # Main text — clean white
-    draw.multiline_text(
-        (x, y),
-        wrapped_text, font=font,
-        fill=(255, 255, 255, 255),
-        align="center",
-        spacing=line_spacing
-    )
+    shadow_offset = max(2, int(font_size * 0.04))
+    stroke_w = max(1, int(font_size * 0.03))
+
+    for line_segs in lines:
+        line_w = _segments_width(draw, font, line_segs, emoji_size, emoji_pad)
+        x = (width - line_w) / 2
+        cy = y + line_height // 2  # vertical center of this line
+
+        for kind, content in line_segs:
+            if kind == "text":
+                seg_w = draw.textlength(content, font=font)
+                # Soft shadow
+                draw.text(
+                    (x + shadow_offset, cy + shadow_offset),
+                    content, font=font, fill=(0, 0, 0, 150), anchor="lm",
+                )
+                # Main text with a thin dark stroke for crispness
+                draw.text(
+                    (x, cy),
+                    content, font=font, fill=(255, 255, 255, 255), anchor="lm",
+                    stroke_width=stroke_w, stroke_fill=(0, 0, 0, 120),
+                )
+                x += seg_w
+            else:
+                emoji_img = _render_emoji_image(content, emoji_size, emoji_font_path)
+                x += emoji_pad
+                if emoji_img is not None:
+                    ex = int(x)
+                    ey = int(cy - emoji_img.height / 2)
+                    img.paste(emoji_img, (ex, ey), emoji_img)
+                    x += emoji_img.width
+                else:
+                    # Fallback: draw as plain text (may show as box, but keeps spacing)
+                    draw.text((x, cy), content, font=font, fill=(255, 255, 255, 255), anchor="lm")
+                    x += draw.textlength(content, font=font)
+                x += emoji_pad
+
+        y += line_height
 
     return img
 
@@ -151,13 +277,10 @@ def process_video(input_path, output_path, quote):
     """
     Takes a raw video, extracts a random 15-second clip,
     applies a subtle dark blur, and overlays styled text.
+    Output is muted (no audio) for faster processing.
     """
     overlay_path = None
     try:
-        # Log working directory and script location for debugging
-        logger.info(f"CWD: {os.getcwd()}")
-        logger.info(f"Script dir: {os.path.dirname(os.path.abspath(__file__))}")
-
         # Get video duration and dimensions
         probe = ffmpeg.probe(input_path)
         video_info = next(s for s in probe['streams'] if s['codec_type'] == 'video')
@@ -165,43 +288,31 @@ def process_video(input_path, output_path, quote):
         vid_width = int(video_info['width'])
         vid_height = int(video_info['height'])
 
-        # Check if the video has an audio stream
-        has_audio = any(s['codec_type'] == 'audio' for s in probe['streams'])
-
         # 15 seconds clip
         clip_duration = min(15, duration)
         start_time = random.uniform(0, max(0, duration - clip_duration))
 
-        # --- Find Bebas Neue font ---
-        font_path = _find_font("BebasNeue-Regular.ttf")
+        # --- Find fonts: Montserrat Bold (modern) for text, Noto Color Emoji for emojis ---
+        font_path = _find_font("Montserrat-Bold.ttf")
         if not font_path:
-            # Try Montserrat as second choice
-            font_path = _find_font("Montserrat-Bold.ttf")
+            font_path = _find_font("BebasNeue-Regular.ttf")
         if not font_path:
             font_path = "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
             logger.warning(f"Falling back to system font: {font_path}")
 
-        logger.info(f"Final font choice: {font_path}")
-
-        # List what's in the assets directory for debugging
-        for search_dir in [os.getcwd(), os.path.dirname(os.path.abspath(__file__)), "/home/site/wwwroot"]:
-            assets_path = os.path.join(search_dir, "assets", "fonts")
-            if os.path.isdir(assets_path):
-                logger.info(f"Contents of {assets_path}: {os.listdir(assets_path)}")
-            else:
-                logger.info(f"Directory not found: {assets_path}")
+        emoji_font_path = _find_font("NotoColorEmoji.ttf")
+        logger.info(f"Text font: {font_path} | Emoji font: {emoji_font_path}")
 
         # --- Create text overlay image with Pillow ---
-        overlay_img = _create_text_overlay(quote, vid_width, vid_height, font_path)
+        overlay_img = _create_text_overlay(quote, vid_width, vid_height, font_path, emoji_font_path)
         overlay_path = output_path.replace(".mp4", "_overlay.png")
         overlay_img.save(overlay_path)
         logger.info(f"Created text overlay: {overlay_path} ({vid_width}x{vid_height})")
 
-        # --- Build FFmpeg pipeline ---
+        # --- Build FFmpeg pipeline (video only, audio stripped) ---
         stream = ffmpeg.input(input_path, ss=start_time, t=clip_duration)
         overlay_input = ffmpeg.input(overlay_path)
 
-        # Process video stream
         v = stream.video
 
         # Subtle darken and gentle blur
@@ -211,25 +322,15 @@ def process_video(input_path, output_path, quote):
         # Overlay the text PNG on top of the blurred video
         v = ffmpeg.overlay(v, overlay_input, x=0, y=0)
 
-        # Handle audio
-        if has_audio:
-            audio = stream.audio
-            out = ffmpeg.output(
-                v, audio, output_path,
-                vcodec='libx264', preset='fast', crf=23,
-                acodec='aac', strict='experimental'
-            )
-        else:
-            silent_audio = ffmpeg.input(
-                'anullsrc=r=44100:cl=stereo', f='lavfi', t=clip_duration
-            )
-            out = ffmpeg.output(
-                v, silent_audio, output_path,
-                vcodec='libx264', preset='fast', crf=23,
-                acodec='aac', strict='experimental', shortest=None
-            )
+        # No audio: faster encode, smaller file
+        out = ffmpeg.output(
+            v, output_path,
+            vcodec='libx264', preset='fast', crf=23,
+            pix_fmt='yuv420p', movflags='+faststart',
+            an=None,
+        )
 
-        logger.info(f"Starting ffmpeg processing for {output_path} (has_audio={has_audio})")
+        logger.info(f"Starting ffmpeg processing for {output_path} (muted)")
         ffmpeg.run(out, overwrite_output=True, capture_stdout=True, capture_stderr=True)
         logger.info(f"Finished processing {output_path}")
         return True
