@@ -66,6 +66,23 @@ def _find_font(name):
     return None
 
 
+def _load_text_font(font_path, size):
+    """Load a font at the given size, selecting the Bold weight for variable fonts."""
+    try:
+        font = ImageFont.truetype(font_path, size)
+    except Exception:
+        return ImageFont.load_default()
+    try:
+        # Variable fonts (e.g. Playfair Display) default to Regular;
+        # switch to Bold when the axis is available.
+        names = font.get_variation_names()
+        if any(b"Bold" == n or n == "Bold" for n in names):
+            font.set_variation_by_name("Bold")
+    except Exception:
+        pass  # static font — already the right weight
+    return font
+
+
 # ---------------------------------------------------------------------------
 # Emoji rendering (Noto Color Emoji is a bitmap font: it only rasterizes at
 # specific strike sizes, so we render big once, cache, and resize down).
@@ -194,10 +211,7 @@ def _layout_text(draw, quote, width, height, font_path):
     min_font_size = 26
 
     while True:
-        try:
-            font = ImageFont.truetype(font_path, font_size)
-        except Exception:
-            font = ImageFont.load_default()
+        font = _load_text_font(font_path, font_size)
         emoji_size = int(font_size * 1.0)
         emoji_pad = max(2, int(font_size * 0.06))
 
@@ -308,8 +322,10 @@ def process_video(input_path, output_path, quote):
         clip_duration = min(15, duration)
         start_time = random.uniform(0, max(0, duration - clip_duration))
 
-        # --- Find fonts: Bebas Neue (clean, condensed) for text, Noto Color Emoji for emojis ---
-        font_path = _find_font("BebasNeue-Regular.ttf")
+        # --- Find fonts: Playfair Display (elegant serif) for text, Noto Color Emoji for emojis ---
+        font_path = _find_font("PlayfairDisplay-Bold.ttf")
+        if not font_path:
+            font_path = _find_font("BebasNeue-Regular.ttf")
         if not font_path:
             font_path = _find_font("Montserrat-Bold.ttf")
         if not font_path:
