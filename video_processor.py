@@ -179,7 +179,18 @@ def _layout_text(draw, quote, width, height, font_path):
         words = [w for w in para.split(" ") if w]
         paragraphs.append([_split_segments(w) for w in words])
 
-    font_size = max(30, int(height / 15))
+    # Length-aware starting size: short quotes get a moderate, clean size
+    # (never huge), longer quotes start smaller. The shrink loop below still
+    # guarantees everything fits in the safe zone.
+    n_chars = len(quote.replace("\n", " ").strip())
+    if n_chars <= 30:
+        font_size = int(height * 0.048)   # ~92px on 1920
+    elif n_chars <= 70:
+        font_size = int(height * 0.042)   # ~80px
+    elif n_chars <= 130:
+        font_size = int(height * 0.036)   # ~69px
+    else:
+        font_size = int(height * 0.030)   # ~57px
     min_font_size = 26
 
     while True:
@@ -297,10 +308,10 @@ def process_video(input_path, output_path, quote):
         clip_duration = min(15, duration)
         start_time = random.uniform(0, max(0, duration - clip_duration))
 
-        # --- Find fonts: Montserrat Bold (modern) for text, Noto Color Emoji for emojis ---
-        font_path = _find_font("Montserrat-Bold.ttf")
+        # --- Find fonts: Bebas Neue (clean, condensed) for text, Noto Color Emoji for emojis ---
+        font_path = _find_font("BebasNeue-Regular.ttf")
         if not font_path:
-            font_path = _find_font("BebasNeue-Regular.ttf")
+            font_path = _find_font("Montserrat-Bold.ttf")
         if not font_path:
             font_path = "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
             logger.warning(f"Falling back to system font: {font_path}")
